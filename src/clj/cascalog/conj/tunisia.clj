@@ -91,6 +91,12 @@
 (def location-data
   (property-data "location"))
 
+;; Clojure variables can be passed directly into queries. No
+;; accidental complexity like parameterized SQL
+(defn location-matches [location]
+  (<- [?person]
+      (location-data ?person location)))
+
 (comment
   ;; names of people with more than 10000 followers
   (?<- (stdout) [?name]
@@ -345,4 +351,7 @@
 
 
 
-;; look at ops implementations
+;; look at implementation of:
+;;   each (used in query from beginning)
+;;   distinct-count (used in query from beginning)
+
