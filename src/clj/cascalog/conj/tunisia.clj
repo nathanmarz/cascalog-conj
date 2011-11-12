@@ -1,6 +1,8 @@
 (ns cascalog.conj.tunisia
   (:use [cascalog api playground])
   (:use [cascalog.contrib.incanter])
+  (:use [cascalog.util :only [collectify]])
+  (:use [clojure.contrib.def :only [defnk]])
   (:require [cascalog [ops :as c] [vars :as v]])
   (:require [clojure.data [json :as json]]))
 
@@ -11,6 +13,9 @@
 
 (defn longify [str]
   (Long/parseLong str))
+
+(defmapcatop split [sentence]
+    (seq (.split sentence "\\s+")))
 
 (def ROOT "/tmp/tunisia")
 
@@ -151,6 +156,8 @@
        first))
 
 (comment
+  ;; bar?- is from cascalog-contrib and creates a bar graph from the
+  ;; passed in subquery. This query here graphs the follower count distribution
   (bar?- (<- [?bucket ?count]
              (followers-count-data _ ?fc)
              (bucketize ?fc :> ?bucket)
@@ -162,4 +169,180 @@
 
   )
   
+(def location-tweets
+  (<- [?location ?amt]
+      (location-data ?person ?location)
+      (reactor-data ?person _)
+      (c/count ?amt)))
+
+(def top-locations
+  (<- [?location ?amt]
+      (location-tweets ?location-in ?amt-in)
+      (:sort ?amt-in) (:reverse true)
+      (c/limit [100] ?location-in ?amt-in :> ?location ?amt)))
+
+(comment
+  (defnk first-n
+    [gen n :sort nil :reverse false]
+    (let [in-fields (get-out-fields gen)
+          out-vars  (v/gen-nullable-vars (count in-fields))]
+      (<- out-vars
+          (gen :>> in-fields)
+          (:sort :<< (if sort (collectify sort)))
+          (:reverse reverse)
+          (c/limit [n] :<< in-fields :>> out-vars))))
+  )
+
+(def top-locations
+  (c/first-n location-tweets 100 :sort "?amt" :reverse true))
+
+(def retweet-counts
+  (<- [?tweet ?count]
+      (reaction-data ?reaction ?tweet)
+      (c/count ?count)))
+
+(def top-tweets
+  (c/first-n retweet-counts 100 :sort "?count" :reverse true))
+
+(def total-retweets
+  (<- [?reactor ?total]
+      (reaction-data _ ?to)
+      (reactor-data ?reactor ?to)
+      (c/count ?total)))
+
+(def comparatively-influential
+  (<- [?bucket ?influencer ?name-out ?count-out ?rank]
+      (followers-count-data ?person ?fc)
+      (total-retweets ?person ?count)
+      (name-data ?person ?name)
+      (bucketize ?fc :> ?bucket)
+      (:sort ?count) (:reverse true)
+      (c/limit-rank [10] ?person ?name ?count :> ?influencer ?name-out ?count-out ?rank)))
+
+(defn to-lower [^String s]
+  (.toLowerCase s))
+
+(def stop-words #{"and" "the" "a" "of" "in" "i" "to" "for" "&" "my" "is" "on" "with" "at" "i'm" "de"
+"-" "you" "from" "am" "all" "me" "about" "an" "it" "be" "that" "by" "who"
+"not" "are" "your" "en" "la" "as" "we" "/" "but" "do" "this" "y" "one" "," "what" "et"
+"e" "or" "also" "so" "our" "don't" "." "@" "!" "..."})
+
+(defn valid-word? [word]
+  (and (> (count word) 2)
+       (not (contains? stop-words word))))
+
+(def description-word-count
+  (<- [?word ?count]
+      (description-data _ ?description)
+      (split ?description :> ?word-raw)
+      (to-lower ?word-raw :> ?word)
+      (valid-word? ?word)
+      (c/count ?count)
+      ))
+
+(def description-tag-cloud
+  (c/first-n description-word-count 100 :sort "?count" :reverse true))
+
+
+(defn chained-pairs-simple [pairs chain-length]
+  (let [out-vars (v/gen-nullable-vars chain-length)
+        var-pairs (partition 2 1 out-vars)]
+    (construct out-vars
+               (concat
+                (for [var-pair var-pairs]
+                  [pairs :>> var-pair])
+                [[:distinct false]]))
+    ))
+
+
+(defn attach-chains [chain1 chain2]
+  (let [out1 (get-out-fields chain1)
+        out2-chained (-> chain2 num-out-fields dec v/gen-nullable-vars)
+        out-vars (concat out1 out2-chained)
+        out2 (cons (last out1) out2-chained)]
+    (<- out-vars
+        (chain1 :>> out1)
+        (chain2 :>> out2)
+        (:distinct false))
+    ))
+
+(defn binary-rep
+  [anum]
+  (for [char (Integer/toBinaryString anum)]
+    (if (= char \1) 1 0)
+    ))
+
+(defn chained-pairs-smart [pairs chain-length]
+  (let [chains (iterate (fn [chain]
+                          (attach-chains chain chain))
+                        pairs)
+        binary (-> chain-length dec binary-rep reverse)
+        chains-to-use (filter identity
+                       (map (fn [chain bit]
+                              (if (= bit 1) chain))
+                            chains
+                            binary))]
+    (reduce attach-chains chains-to-use)
+    ))
+
+
+;; look at any and all
+
+(deffilterop bieberless? [description]
+  (not (.contains (.toLowerCase description) "bieber")))
+
+(deffilterop reasonable-size? [description]
+  (> (count description) 20))
+
+(deffilterop political? [description]
+  (.contains (.toLowerCase description) "politic"))
+
+(comment
+  (?<- (stdout) [?description]
+       (description-data _ ?description)
+       (bieberless? ?description)
+       (reasonable-size? ?description)
+       (political? ?description))
+
+  (?<- (stdout) [?description]
+       (description-data _ ?description)
+       ((c/all bieberless? reasonable-size? political?) ?description)
+       )
   
+  (defn all [& ops]    
+    (construct
+     [:<< "!invars" :>]       
+     (map (fn [o] [o :<< "!invars"]) ops)
+     ))
+
+  (?<- (stdout) [?description]
+       (description-data _ ?description)
+       ((c/all (c/negate bieberless?)
+               reasonable-size?
+               political?)
+        ?description))
+
+  (?<- (stdout) [?description]
+       (description-data _ ?description)
+       ((c/negate (c/any bieberless?
+                         reasonable-size?
+                         political?))
+        ?description))
+
+  (defn bool-or [& vars]
+    (boolean (some identity vars)))
+  
+  (defn any [& ops]
+    (let [outvars (v/gen-nullable-vars (count ops))]
+      (construct
+       [:<< "!invars" :> "!true?"]
+       (conj
+        (map (fn [o v] [o :<< "!invars" :> v]) ops outvars)
+        [#'bool-or :<< outvars :> "!true?"]))))
+  )
+
+;; go back to description-word-count and show use of c/comp to make it more concise
+
+
+
+;; look at ops implementations
